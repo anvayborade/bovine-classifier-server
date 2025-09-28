@@ -1,0 +1,10 @@
+# .gitignore (FastAPI)
+__pycache__/
+.venv/
+venv/
+.idea/
+.vscode/
+.pytest_cache/
+*.pyc
+*.pyo
+.DS_Store

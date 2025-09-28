@@ -1,7 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, Query
+# server.py
+from fastapi import FastAPI, UploadFile, File, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Literal
 from functools import lru_cache
 from pathlib import Path
 from PIL import Image, ImageOps
@@ -11,7 +12,19 @@ from torchvision.transforms.functional import InterpolationMode
 
 # Optional: used only if a checkpoint is an Ultralytics YOLO classification ckpt
 from ultralytics import YOLO
-import timm  # kept as a fallback if a ckpt truly was trained with timm
+import timm  # fallback if a ckpt truly was trained with timm
+
+import os
+import httpx
+import google.generativeai as genai
+
+from pydantic import BaseModel
+from typing import List
+
+import asyncio, time, math
+from typing import List, Optional, Dict, Literal
+from fastapi import HTTPException
+import math, httpx
 
 # -------------------- CONFIG --------------------
 MODELS: Dict[str, dict] = {
@@ -27,7 +40,6 @@ def _bb_normalize(s: str) -> str:
     s = s.strip().lower().replace('-', '_').replace(' ', '_')
     s = s.replace('mobilenet_v3', 'mobilenet_v3')
     s = s.replace('efficientnet_v2', 'efficientnet_v2')
-    # collapse your alias
     if s.startswith('effb0'):
         s = 'efficientnet_b0'
     if s in {'mnv3l','mbv3l','mobilenetv3_large'}:
@@ -51,15 +63,13 @@ def build_torchvision(backbone: str, num_classes: int) -> nn.Module:
         return m
     if key == 'mobilenet_v3_large':
         m = tvm.mobilenet_v3_large(weights=None)
-        # final linear is classifier[-1]
-        # (classifier = [Dropout, Linear, Dropout, Linear])
         lin_idx = -1
         in_f = m.classifier[lin_idx].in_features
         m.classifier[lin_idx] = nn.Linear(in_f, num_classes)
         return m
     raise ValueError(f"Unknown torchvision backbone '{backbone}' (normalized '{key}')")
 
-# timm fallback (rarely needed now)
+# timm fallback
 def build_timm(backbone: str, num_classes: int) -> nn.Module:
     key = _bb_normalize(backbone)
     arch_map = {
@@ -80,20 +90,36 @@ def make_tfm(imgsz: int):
         transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
     ])
 
+# =============== SINGLE APP + CORS ===============
 app = FastAPI(title="Bovine Breed API (TorchVision + Logit Ensemble)")
 app.add_middleware(
     CORSMiddleware,
+    # For dev you can keep this permissive. If you later use cookies, switch to allow_origins=[].
     allow_origin_regex=r".*",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# =============== SCHEMAS =========================
 class PredictResponse(BaseModel):
     model: str
     label: str
     confidence: float
     top5: List[Tuple[str, float]]
+
+class Place(BaseModel):
+    id: int
+    name: Optional[str] = None
+    lat: float
+    lon: float
+    category: str
+    tags: Dict[str, str] = {}
+
+class AiReq(BaseModel):
+    breed: str
+    location: Optional[str] = None
+    extra: Optional[str] = None
 
 # ---------- helpers: labels / meta ----------
 @lru_cache(maxsize=1)
@@ -151,7 +177,7 @@ def load_model(key: str) -> Wrapped:
     except Exception:
         pass
 
-    # 2) Prefer TorchVision (matches your checkpoints)
+    # 2) Prefer TorchVision
     try:
         net = build_torchvision(backbone, num_classes=len(names))
         ckpt = torch.load(ck, map_location="cpu")
@@ -162,7 +188,7 @@ def load_model(key: str) -> Wrapped:
     except Exception as e_tv:
         print(f"[INFO] TorchVision load failed for '{key}' with backbone '{backbone}': {e_tv}")
 
-    # 3) Fallback to timm if truly needed
+    # 3) Fallback to timm
     net = build_timm(backbone, num_classes=len(names))
     ckpt = torch.load(ck, map_location="cpu")
     _load_state_dict_smart(net, ckpt)
@@ -202,21 +228,202 @@ def align_logits_to_canonical(w: Wrapped, logits: torch.Tensor, canon: List[str]
     cols = [idx_map[name] for name in canon]
     return logits[:, cols]
 
-# ================= API =================
-app = FastAPI(title="Bovine Breed API (TorchVision + Logit Ensemble)")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ================= ROUTES =================
+@app.get("/healthz")
+def healthz():
+    return {"ok": True}
 
-class PredictResponse(BaseModel):
-    model: str
-    label: str
-    confidence: float
-    top5: List[Tuple[str, float]]
+#class PlacesResponse(BaseModel):
+#    places: List[Place]
+
+_OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+]
+_HTTP_TIMEOUT = httpx.Timeout(connect=4.0, read=8.0, write=4.0, pool=4.0)  # per mirror
+_PLACES_CACHE: dict = {}  # key -> (ts, list[Place])
+_PLACES_TTL_SEC = 300     # 5 minutes
+
+def _bbox_from_center(lat: float, lon: float, radius_m: int):
+    radius_km = radius_m / 1000.0
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(0.01, math.cos(math.radians(lat))))
+    left = lon - dlon
+    right = lon + dlon
+    top = lat + dlat
+    bottom = lat - dlat
+    return left, top, right, bottom
+
+def _places_cache_key(lat: float, lon: float, radius_m: int, type_: str, limit: int):
+    # round lat/lon to ~100m and bucket radius to reduce cache keys
+    return (round(lat, 3), round(lon, 3), int((radius_m // 1000) * 1000), type_, limit)
+
+async def _overpass_first_ok(query: str):
+    async with httpx.AsyncClient(
+        headers={"User-Agent": "BovineApp/1.0 (contact: dev@yourapp.example)"},
+        timeout=_HTTP_TIMEOUT
+    ) as client:
+        async def call(url):
+            try:
+                r = await client.post(url, data={"data": query})
+                if r.status_code == 200:
+                    return r.json()
+            except Exception:
+                return None
+            return None
+        tasks = [asyncio.create_task(call(u)) for u in _OVERPASS_MIRRORS]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED, timeout=10)
+        for p in pending:
+            p.cancel()
+        for d in done:
+            js = d.result()
+            if js:
+                return js
+        return None
+
+@app.get("/places", response_model=list[Place])
+async def places(
+    lat: float,
+    lon: float,
+    radius_m: int = 50000,
+    type: Literal["vet", "market", "dairy"] = "vet",
+    limit: int = 30,
+    nocache: bool = False,  # <-- new
+):
+    key = _places_cache_key(lat, lon, radius_m, type, limit)
+    now = time.time()
+
+    # serve from cache ONLY if not forced and cached payload is non-empty
+    if not nocache and key in _PLACES_CACHE:
+        ts, payload = _PLACES_CACHE[key]
+        if now - ts < _PLACES_TTL_SEC and payload:
+            print(f"[places] cache hit {type} -> {len(payload)}")
+            return payload
+
+    # -------- build and run Overpass query (unchanged patterns) ----------
+    # inside /places(...)
+    if type == "vet":
+        filters = f"""
+      node["amenity"="veterinary"](around:{radius_m},{lat},{lon});
+      way["amenity"="veterinary"](around:{radius_m},{lat},{lon});
+      relation["amenity"="veterinary"](around:{radius_m},{lat},{lon});
+
+      node["healthcare"="veterinary"](around:{radius_m},{lat},{lon});
+      way["healthcare"="veterinary"](around:{radius_m},{lat},{lon});
+      relation["healthcare"="veterinary"](around:{radius_m},{lat},{lon});
+
+      node["shop"="veterinary"](around:{radius_m},{lat},{lon});
+      way["shop"="veterinary"](around:{radius_m},{lat},{lon});
+      relation["shop"="veterinary"](around:{radius_m},{lat},{lon});
+
+      node["shop"="pet"]["veterinary"="yes"](around:{radius_m},{lat},{lon});
+      way["shop"="pet"]["veterinary"="yes"](around:{radius_m},{lat},{lon});
+      relation["shop"="pet"]["veterinary"="yes"](around:{radius_m},{lat},{lon});
+
+      node["amenity"="clinic"]["name"~"(?i)(vet|animal|pet)"](around:{radius_m},{lat},{lon});
+      way["amenity"="clinic"]["name"~"(?i)(vet|animal|pet)"](around:{radius_m},{lat},{lon});
+      relation["amenity"="clinic"]["name"~"(?i)(vet|animal|pet)"](around:{radius_m},{lat},{lon});
+    """
+    elif type == "market":
+        filters = f"""
+      node["amenity"="marketplace"](around:{radius_m},{lat},{lon});
+      way["amenity"="marketplace"](around:{radius_m},{lat},{lon});
+      relation["amenity"="marketplace"](around:{radius_m},{lat},{lon});
+
+      node[~"name"~"(?i)(mandi|market)"](around:{radius_m},{lat},{lon});
+      way[~"name"~"(?i)(mandi|market)"](around:{radius_m},{lat},{lon});
+      relation[~"name"~"(?i)(mandi|market)"](around:{radius_m},{lat},{lon});
+    """
+    else:  # type == "dairy"
+    # dairy plants / collection / brands (Amul, Mother Dairy, Country Delight, Nandini, Hatsun, Verka, etc.)
+        filters = f"""
+      node["industrial"="dairy"](around:{radius_m},{lat},{lon});
+      way["industrial"="dairy"](around:{radius_m},{lat},{lon});
+      relation["industrial"="dairy"](around:{radius_m},{lat},{lon});
+
+      node["shop"="dairy"](around:{radius_m},{lat},{lon});
+      way["shop"="dairy"](around:{radius_m},{lat},{lon});
+      relation["shop"="dairy"](around:{radius_m},{lat},{lon});
+
+      node[~"name"~"(?i)(dairy|milk|collection|amul|mother dairy|country delight|nandini|hatsun|verka|aavin|parag|gokul|heritage|milky mist)"](around:{radius_m},{lat},{lon});
+      way[~"name"~"(?i)(dairy|milk|collection|amul|mother dairy|country delight|nandini|hatsun|verka|aavin|parag|gokul|heritage|milky mist)"](around:{radius_m},{lat},{lon});
+      relation[~"name"~"(?i)(dairy|milk|collection|amul|mother dairy|country delight|nandini|hatsun|verka|aavin|parag|gokul|heritage|milky mist)"](around:{radius_m},{lat},{lon});
+    """
+
+
+    overpass_query = f"""
+    [out:json][timeout:12];
+    (
+      {filters}
+    );
+    out center tags;
+    """
+
+    elements = []
+    try:
+        js = await _overpass_first_ok(overpass_query)
+        if js:
+            elements = js.get("elements", [])
+    except Exception as e:
+        print(f"[places] overpass error: {e}")
+
+    payload: list[dict] = []
+    for el in elements:
+        latv = el.get("lat") or (el.get("center") or {}).get("lat")
+        lonv = el.get("lon") or (el.get("center") or {}).get("lon")
+        if latv is None or lonv is None:
+            continue
+        tags = el.get("tags", {}) or {}
+        payload.append({
+            "id": int(el["id"]),
+            "name": tags.get("name"),
+            "lat": float(latv),
+            "lon": float(lonv),
+            "category": type,
+            "tags": {k: str(v) for k, v in tags.items()},
+        })
+        if len(payload) >= limit:
+            break
+
+    # Nominatim fallback only if still empty
+    if not payload:
+        try:
+            left, top, right, bottom = _bbox_from_center(lat, lon, radius_m)
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "BovineApp/1.0 (contact: dev@yourapp.example)"},
+                timeout=_HTTP_TIMEOUT
+            ) as client:
+                q = "veterinary" if type == "vet" else "market"
+                params = {
+                    "format": "jsonv2",
+                    "q": q,
+                    "bounded": 1,
+                    "viewbox": f"{left},{top},{right},{bottom}",
+                    "limit": limit,
+                }
+                r = await client.get("https://nominatim.openstreetmap.org/search", params=params)
+                if r.status_code == 200:
+                    js = r.json()
+                    for i, it in enumerate(js[:limit]):
+                        payload.append({
+                            "id": 10_000_000 + i,
+                            "name": it.get("display_name") or it.get("name"),
+                            "lat": float(it.get("lat")),
+                            "lon": float(it.get("lon")),
+                            "category": type,
+                            "tags": {"source": "nominatim", "class": str(it.get("class")), "type": str(it.get("type"))},
+                        })
+        except Exception as e:
+            print(f"[places] nominatim error: {e}")
+
+    # only cache non-empty results
+    if payload:
+        _PLACES_CACHE[key] = (now, payload)
+    else:
+        print(f"[places] not caching empty result for {type}")
+
+    print(f"[places] type={type} r={radius_m} -> {len(payload)} results (limit={limit})")
+    return payload
 
 @app.get("/models")
 def list_models():
@@ -308,3 +515,123 @@ async def predict_ensemble(
 @app.get("/ping")
 def ping():
     return {"ok": True}
+
+# ================= Gemini =================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+print(GEMINI_API_KEY)
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    _gem = genai.GenerativeModel("gemini-2.5-flash")  # fast & economical
+else:
+    _gem = None
+
+@app.post("/ai/crossbreed")
+def ai_crossbreed(req: AiReq):
+    if not _gem: return {"error":"GEMINI_API_KEY not set"}
+    prompt = f"""
+You are an expert cattle breeding assistant in India.
+Breed: {req.breed}
+Location: {req.location or 'unknown'}
+
+List 3-5 compatible crossbreeds with {req.breed}. For each:
+- compatibility reason
+- pros/cons (health, yield, climate fit)
+- cost/economic feasibility (rough idea)
+
+Return concise bullet points.
+"""
+    out = _gem.generate_content(prompt)
+    return {"text": out.text}
+
+@app.post("/ai/market")
+def ai_market(req: AiReq):
+    if not _gem: return {"error":"GEMINI_API_KEY not set"}
+    prompt = f"""
+You are a livestock market advisor.
+Breed: {req.breed}
+Location: {req.location or 'unknown'}
+
+Give:
+- current indicative price range for {req.breed} (in INR) with assumptions
+- 3-5 negotiation tips
+- 3 nearby place types to sell (mandis/co-ops), not specific names.
+
+Be concise. Mention uncertainty.
+"""
+    out = _gem.generate_content(prompt)
+    return {"text": out.text}
+
+@app.post("/ai/vaccinations")
+def ai_vaccinations(req: AiReq):
+    if not _gem: return {"error":"GEMINI_API_KEY not set"}
+    prompt = f"""
+You are a veterinary assistant.
+Breed: {req.breed}
+Region: {req.location or 'unknown'}
+
+Provide:
+- Core vaccinations (names, typical schedule windows)
+- Parasite control and general care tips
+- Any breed/regional caveats
+
+Keep terse & practical. This is not medical advice.
+"""
+    out = _gem.generate_content(prompt)
+    return {"text": out.text}
+
+class DairyReq(BaseModel):
+    breed: str | None = None
+    location: str | None = None
+    extra: str | None = None
+
+@app.post("/ai/dairy_market")
+def ai_dairy(req: DairyReq):
+    if not _gem: 
+        return {"error": "GEMINI_API_KEY not set"}
+    prompt = f"""
+You are a dairy procurement advisor for Indian farmers.
+Location: {req.location or 'unknown'}
+
+Give concise bullets:
+- Nearby well-known dairies/brands (e.g., Amul, Mother Dairy, Country Delight, Nandini, Hatsun, Verka) that typically procure milk via collection centers
+- The kind(s) of milk they commonly buy (cow/buffalo/mixed), common SNF/fat expectations (indicative)
+- Typical delivery process (collection center timings, chilling, quality testing basics)
+- Price notes are indicative and vary; mention uncertainty.
+
+Keep it short. Avoid guarantees.
+"""
+    out = _gem.generate_content(prompt)
+    return {"text": out.text}
+
+# --- NEW: Translate to Hindi for TTS -----------------------------------------
+@app.post("/ai/translate_hi")
+def ai_translate_hi(req: AiReq):
+    """
+    Translate arbitrary text (sent in req.breed) into natural spoken Hindi,
+    stripping markdown/URLs/parenthetical noise. Returns {"text": "..."}.
+    """
+    if not _gem:
+        return {"error": "GEMINI_API_KEY not set"}
+
+    # We reuse AiReq.breed as the input text (matches your ApiService.ai signature)
+    src = (req.breed or "").strip()
+    if not src:
+        return {"error": "No text provided to translate"}
+
+    prompt = f"""
+You are a professional Hindi translator and copy editor.
+Task: Translate the text into natural, conversational Hindi suitable for text-to-speech.
+Rules:
+- Remove markdown symbols, URLs, and any bracketed/parenthetical content.
+- Keep bullets as short, simple lines if present.
+- Output ONLY the final Hindi text. No preface, no notes, no quotes.
+
+Text:
+{src}
+"""
+    try:
+        out = _gem.generate_content(prompt)
+        text = (getattr(out, "text", "") or "").strip()
+        return {"text": text}
+    except Exception as e:
+        return {"error": f"translate_hi failed: {e}"}
